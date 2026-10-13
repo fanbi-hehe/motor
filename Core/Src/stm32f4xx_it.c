@@ -205,29 +205,16 @@ void SysTick_Handler(void)
 /* USER CODE BEGIN 1 */
 
 /**
-  * @brief  USART1 接收中断: VOFA+ 下发的 ASCII 命令
+  * @brief  USART1 中断: 交给 VOFA 驱动处理收发
   *
-  *  直接读 DR 清标志, 不经过 HAL 的接收状态机, 避免与阻塞发送互相干扰。
-  *  同时处理 ORE/NE/FE/PE: 这些错误标志必须通过"先读 SR 再读 DR"清除,
-  *  否则会反复进入中断。
+  *  收发都不走 HAL 的状态机, 直接操作寄存器:
+  *   - RXNE -> 收字节进环形缓冲, 同时清 ORE/NE/FE/PE
+  *   - TXE  -> 从发送环形缓冲取字节写 DR, 发完自动关 TXE 中断
+  *  这样底层就没有阻塞式发送, 数据帧的节奏不会被 I2C 刷屏打断。
   */
 void USART1_IRQHandler(void)
 {
-  uint32_t sr = USART1->SR;
-
-  if ((sr & USART_SR_RXNE) != 0u)
-  {
-    VOFA_RxByte((uint8_t)(USART1->DR & 0xFFu));
-  }
-  else if ((sr & (USART_SR_ORE | USART_SR_NE | USART_SR_FE | USART_SR_PE)) != 0u)
-  {
-    (void)USART1->DR;
-  }
-  else
-  {
-    /* 其他中断源: 交回 HAL 处理 */
-    HAL_UART_IRQHandler(&huart1);
-  }
+  VOFA_IrqHandler();
 }
 
 /* USER CODE END 1 */

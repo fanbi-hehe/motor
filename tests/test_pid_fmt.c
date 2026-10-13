@@ -23,6 +23,7 @@
 #include "fmt.h"
 #include "encoder.h"
 #include "app.h"
+#include "vofa.h"
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -37,6 +38,38 @@ static void check_str(const char *name, const char *got, const char *want)
 {
   if (strcmp(got, want) == 0) { g_pass++; printf("  PASS  %-34s = \"%s\"\n", name, got); }
   else { g_fail++; printf("  FAIL  %-34s got \"%s\", want \"%s\"\n", name, got, want); }
+}
+
+/* 按长度比较: 帧构造是纯字节流, 不写结束符, 所以不能用 strcmp */
+static void check_str_n(const char *name, const char *got, uint16_t len, const char *want)
+{
+  if ((len == (uint16_t)strlen(want)) && (memcmp(got, want, len) == 0))
+  {
+    g_pass++;
+    printf("  PASS  %-34s = \"%s\" (%u bytes)\n", name, want, (unsigned)len);
+  }
+  else
+  {
+    g_fail++;
+    printf("  FAIL  %-34s got %u bytes \"%.*s\", want %u bytes \"%s\"\n",
+           name, (unsigned)len, (int)len, got, (unsigned)strlen(want), want);
+  }
+}
+
+static void check_hex(const char *name, const uint8_t *got, const uint8_t *want, int n)
+{
+  int i;
+  for (i = 0; i < n; i++)
+  {
+    if (got[i] != want[i])
+    {
+      g_fail++;
+      printf("  FAIL  %-34s byte[%d] = 0x%02X, want 0x%02X\n", name, i, got[i], want[i]);
+      return;
+    }
+  }
+  g_pass++;
+  printf("  PASS  %-34s %d bytes ok\n", name, n);
 }
 
 static void check_near(const char *name, double got, double want, double tol)
@@ -306,6 +339,161 @@ static void test_pid_closed_loop(void)
   else { g_fail++; printf("  FAIL  low-speed error = %.2f rpm\n", fabs(v - 100.0f)); }
 }
 
+/* ------------------------------------------------------------------ */
+/* 8. JustFloat 二进制帧构造                                          */
+/* ------------------------------------------------------------------ */
+static void test_justfloat(void)
+{
+  uint8_t buf[VOFA_MAX_CHANNELS * 4u + 4u];
+  uint8_t expect[VOFA_MAX_CHANNELS * 4u + 4u];
+  const uint8_t tail[4] = {0x00u, 0x00u, 0x80u, 0x7Fu};
+  float  v[VOFA_MAX_CHANNELS];
+  uint16_t len;
+  uint8_t  i, k;
+  float    back;
+
+  printf("\n[8] JustFloat framing\n");
+
+  /* --- 单值: 1.0f 的 IEEE-754 位型 0x3F800000, 小端应为 00 00 80 3F --- */
+  v[0] = 1.0f;
+  len = VOFA_BuildJustFloat(buf, v, 1u);
+  expect[0] = 0x00u; expect[1] = 0x00u; expect[2] = 0x80u; expect[3] = 0x3Fu;
+  check_int("1 channel frame length", (int)len, 8);
+  check_hex("1.0f little-endian", buf, expect, 4);
+  check_hex("frame tail", &buf[4], tail, 4);
+
+  /* --- 4 通道: 20 字节, 帧尾固定 --- */
+  v[0] = 100.5f;    /* 0x42C90000 -> 00 00 C9 42 */
+  v[1] = -2.5f;     /* 0xC0200000 -> 00 00 20 C0 */
+  v[2] = 0.0f;      /* 0x00000000 -> 00 00 00 00 */
+  v[3] = -0.125f;   /* 0xBE000000 -> 00 00 00 BE */
+  len = VOFA_BuildJustFloat(buf, v, 4u);
+  check_int("4 channels frame length", (int)len, 20);
+  expect[0]  = 0x00u; expect[1]  = 0x00u; expect[2]  = 0xC9u; expect[3]  = 0x42u;
+  expect[4]  = 0x00u; expect[5]  = 0x00u; expect[6]  = 0x20u; expect[7]  = 0xC0u;
+  expect[8]  = 0x00u; expect[9]  = 0x00u; expect[10] = 0x00u; expect[11] = 0x00u;
+  expect[12] = 0x00u; expect[13] = 0x00u; expect[14] = 0x00u; expect[15] = 0xBEu;
+  check_hex("4 channel payload", buf, expect, 16);
+  check_hex("4 channel tail", &buf[16], tail, 4);
+
+  /* --- 8 通道: 36 字节 --- */
+  for (i = 0u; i < 8u; i++) { v[i] = (float)i; }
+  len = VOFA_BuildJustFloat(buf, v, 8u);
+  check_int("8 channels frame length", (int)len, 36);
+  check_hex("8 channel tail", &buf[32], tail, 4);
+  {
+    float b8;
+    int   ok8 = 1;
+    for (i = 0u; i < 8u; i++)
+    {
+      memcpy(&b8, &buf[(int)i * 4], 4);
+      if (b8 != v[i]) { ok8 = 0; }
+    }
+    if (ok8 != 0) { g_pass++; printf("  PASS  8 channel values round-trip\n"); }
+    else { g_fail++; printf("  FAIL  8 channel values differ\n"); }
+  }
+
+  /* --- 往返: 按上位机的方式找帧尾、切帧、还原浮点 --- */
+  {
+    uint8_t stream[64];
+    uint16_t pos = 0u;
+    uint8_t  frames = 3u;
+    uint8_t  f;
+
+    /* 连续 3 帧, 模拟真实数据流 */
+    for (f = 0u; f < frames; f++)
+    {
+      float src[3];
+      src[0] = 100.0f + (float)f;
+      src[1] = -50.0f - (float)f;
+      src[2] = 0.25f * (float)f;
+      pos = (uint16_t)(pos + VOFA_BuildJustFloat(&stream[pos], src, 3u));
+    }
+
+    /* 上位机: 扫描 00 00 80 7F, 前面就是 3 个 float */
+    {
+      int      start = 0;
+      uint8_t  nframe = 0u;
+      int      j;
+      for (j = 0; (j + 3) < (int)pos; j++)
+      {
+        if ((stream[j] == 0x00u) && (stream[j + 1] == 0x00u) &&
+            (stream[j + 2] == 0x80u) && (stream[j + 3] == 0x7Fu))
+        {
+          int payload = j - start;      /* 帧尾前的字节都是本帧负载 */
+          if (payload == 12)
+          {
+            float got[3];
+            for (k = 0u; k < 3u; k++)
+            {
+              memcpy(&got[k], &stream[start + (int)k * 4], 4);
+            }
+            if (nframe == 0u)
+            {
+              check_near("round-trip ch0", got[0], 100.0, 1e-6);
+              check_near("round-trip ch1", got[1], -50.0, 1e-6);
+              check_near("round-trip ch2", got[2], 0.0, 1e-6);
+            }
+            nframe++;
+          }
+          start = j + 4;
+          j += 3;
+        }
+      }
+      check_int("round-trip frames decoded", (int)nframe, (int)frames);
+    }
+  }
+
+  /* --- 解析回读: 每一路都要和写入值完全一致 --- */
+  v[0] = 1234.5f; v[1] = -0.001f; v[2] = 4095.75f; v[3] = -30000.0f;
+  len = VOFA_BuildJustFloat(buf, v, 4u);
+  check_int("4ch length again", (int)len, 20);
+  for (i = 0u; i < 4u; i++)
+  {
+    memcpy(&back, &buf[(int)i * 4], 4);
+    if (back == v[i]) { g_pass++; }
+    else { g_fail++; printf("  FAIL  value[%d] round-trip %.6f != %.6f\n", i, (double)back, (double)v[i]); }
+  }
+  if (g_fail == 0) { printf("  PASS  all 4 values bit-exact round-trip\n"); }
+
+  /* --- 帧尾常量必须是 +Inf 的小端表示 --- */
+  {
+    float inf;
+    uint8_t t2[4] = {VOFA_JUSTFLOAT_TAIL_0, VOFA_JUSTFLOAT_TAIL_1,
+                     VOFA_JUSTFLOAT_TAIL_2, VOFA_JUSTFLOAT_TAIL_3};
+    memcpy(&inf, t2, 4);
+    if ((inf > 3.0e38f) && (inf != inf * 0.0f)) { g_pass++; printf("  PASS  tail decodes to +Inf (0x7F800000)\n"); }
+    else { g_fail++; printf("  FAIL  tail does not decode to +Inf\n"); }
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 9. FireWater ASCII 帧构造 (切回文本协议时使用)                     */
+/* ------------------------------------------------------------------ */
+static void test_firewater(void)
+{
+  char     buf[VOFA_FRAME_BUF_SIZE];
+  float    v[4];
+  uint16_t len;
+
+  printf("\n[9] FireWater framing\n");
+
+  v[0] = 1.5f;
+  v[1] = -2.25f;
+  len = VOFA_BuildFireWater(buf, (uint16_t)sizeof(buf), v, 2u);
+  check_int("2 channels length", (int)len, 11);
+  check_str_n("csv + newline", buf, len, "1.50,-2.25\n");
+
+  v[0] = 1500.0f; v[1] = 1489.34f; v[2] = 3821.0f; v[3] = 10.66f;
+  len = VOFA_BuildFireWater(buf, (uint16_t)sizeof(buf), v, 4u);
+  check_str_n("4 channels csv", buf, len, "1500.00,1489.34,3821.00,10.66\n");
+  check_int("ends with newline", (int)buf[len - 1u], '\n');
+
+  /* 缓冲区不足时必须整体失败, 不能发出半帧 */
+  len = VOFA_BuildFireWater(buf, 8u, v, 4u);
+  check_int("tiny buffer rejected", (int)len, 0);
+}
+
 int main(void)
 {
   printf("==== motor PID / format unit tests ====\n");
@@ -317,6 +505,8 @@ int main(void)
   test_pid_derivative();
   test_pid_separation();
   test_pid_closed_loop();
+  test_justfloat();
+  test_firewater();
 
   printf("\n==== result: %d passed, %d failed ====\n", g_pass, g_fail);
   return (g_fail == 0) ? 0 : 1;

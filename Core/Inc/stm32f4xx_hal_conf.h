@@ -96,7 +96,10 @@
   *        (when HSE is used as system clock source, directly or through the PLL).
   */
 #if !defined  (HSE_VALUE)
-  #define HSE_VALUE    25000000U /*!< Value of the External oscillator in Hz */
+  /* 板上晶振为 8 MHz (不是 CubeMX 默认的 25 MHz)。
+     若此值与实物不符, 整棵时钟树都会按错误比例缩放:
+     串口波特率会差 25/8 = 3.125 倍, 表现为上位机只能收到 00/1C/E0/FC 之类的乱码。 */
+  #define HSE_VALUE    8000000U /*!< Value of the External oscillator in Hz */
 #endif /* HSE_VALUE */
 
 #if !defined  (HSE_STARTUP_TIMEOUT)

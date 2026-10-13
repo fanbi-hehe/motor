@@ -21,7 +21,7 @@
 static PID_t  s_pid;
 
 static volatile float   s_target_rpm    = 0.0f;   /* 目标转速 (RPM) */
-static volatile uint8_t s_enabled       = 0u;     /* 闭环/开环总使能 */
+static volatile uint8_t s_enab led       = 0u;     /* 闭环/开环总使能 */
 static volatile uint8_t s_closed_loop   = 1u;     /* 1 = 闭环, 0 = 开环 */
 static volatile int16_t s_open_duty     = 0;      /* 开环占空比 */
 static volatile uint32_t s_safe_ms      = 0u;     /* 通信超时保护 (0 = 关闭) */
@@ -29,13 +29,25 @@ static volatile uint32_t s_safe_ms      = 0u;     /* 通信超时保护 (0 = 关
 static volatile float   s_speed_rpm     = 0.0f;   /* 最近一次实际转速 */
 static volatile float   s_err           = 0.0f;   /* 最近一次误差 */
 
+static volatile uint8_t s_fault         = 0u;     /* 保护锁定标志 */
+static uint16_t s_over_cnt  = 0u;                 /* 过速持续计数 (控制周期数) */
+static uint16_t s_stall_cnt = 0u;                 /* 反馈丢失持续计数 */
+
 static volatile uint32_t s_ms           = 0u;
 static volatile uint8_t  s_tele_due     = 0u;
 static volatile uint8_t  s_oled_due     = 0u;
 
 static char s_msg[24] = "BOOT";
 
+/* 保护判定需要的控制周期数 */
+#define APP_FAULT_TICKS   (APP_FAULT_MS / APP_CONTROL_PERIOD_MS)
+
 /* ============================ 小工具 ============================ */
+
+static float App_Absf(float x)
+{
+  return (x < 0.0f) ? -x : x;
+}
 
 static float App_Clampf(float x, float lo, float hi)
 {
@@ -185,6 +197,15 @@ static void App_DumpParams(void)
   App_Append(buf, (uint16_t)sizeof(buf), n);
   App_Append(buf, (uint16_t)sizeof(buf), (s_enabled != 0u) ? " ENABLE=1" : " ENABLE=0");
   App_Append(buf, (uint16_t)sizeof(buf), (s_closed_loop != 0u) ? " MODE=CLOSED" : " MODE=OPEN");
+  App_Append(buf, (uint16_t)sizeof(buf), (s_fault != 0u) ? " FAULT" : " OK");
+  VOFA_SendLine(buf);
+
+  /* ---- 通信 ---- */
+  buf[0] = '\0';
+  App_Append(buf, (uint16_t)sizeof(buf),
+             (VOFA_GetProtocol() != 0u) ? "LINK JUSTFLOAT CH=4" : "LINK FIREWATER CH=4");
+  App_Append(buf, (uint16_t)sizeof(buf),
+             (VOFA_GetTextReply() != 0u) ? " TEXT=1" : " TEXT=0");
   VOFA_SendLine(buf);
 }
 
@@ -192,7 +213,7 @@ static void App_Help(void)
 {
   VOFA_SendLine("---- VOFA+ PID Motor Speed Control ----");
   VOFA_SendLine("1200            set target rpm (same as TARGET 1200)");
-  VOFA_SendLine("TARGET <rpm>    set target speed, negative = reverse");
+  VOFA_SendLine("TARGET <rpm>    set target; also enables the drive (no START needed)");
   VOFA_SendLine("KP <v> KI <v> KD <v>   tune PID gains");
   VOFA_SendLine("LIMIT <v>       output limit (0..4199)");
   VOFA_SendLine("SEP <v>         integral separation zone (0=off)");
@@ -201,10 +222,100 @@ static void App_Help(void)
   VOFA_SendLine("START / STOP    enable / disable the drive");
   VOFA_SendLine("RESET           clear PID internal state");
   VOFA_SendLine("OPEN / CLOSE    open-loop / closed-loop mode");
-  VOFA_SendLine("DUTY <v>        open-loop duty (-4199..4199)");
+  VOFA_SendLine("DUTY <v>        open-loop test (-4199..4199), also enables");
   VOFA_SendLine("SAFE <ms>       stop if no command within ms (0=off)");
+  VOFA_SendLine("TEXT 0|1        mute / unmute these text replies");
   VOFA_SendLine("SAVE            print current settings");
   VOFA_SendLine("HELP            print this help");
+}
+
+/* ============================ 使能与保护 ============================ */
+
+/* 清除保护锁定并复位 PID */
+static void App_ClearFault(void)
+{
+  s_fault     = 0u;
+  s_over_cnt  = 0u;
+  s_stall_cnt = 0u;
+  PID_Reset(&s_pid);
+}
+
+/* 使能驱动 (设定目标时自动调用, 不必再发 START) */
+static void App_EnableDrive(void)
+{
+  App_ClearFault();
+  s_enabled = 1u;
+}
+
+/* 保护锁定: 停机并给出原因 */
+static void App_LatchFault(const char *reason)
+{
+  s_enabled = 0u;
+  Motor_Stop();
+  PID_Reset(&s_pid);
+  s_fault = 1u;
+  App_SetMsg(reason);
+  VOFA_SendLine(reason);
+}
+
+/**
+  * @brief  保护检查, 每个控制周期调用
+  *
+  *  1) 过速:      |实际| > APP_OVERSPEED_RPM
+  *  2) 反馈丢失:  输出接近满量程, 转速却一直低于 APP_STALL_RPM
+  *                (编码器没信号 / 电机没供电 / 堵转)
+  *  持续 APP_FAULT_MS 后锁定停机, 发 START / RESET / 新目标值 可解除。
+  */
+static void App_FaultCheck(void)
+{
+  int16_t duty  = Motor_GetDuty();
+  float   absd  = App_Absf((float)duty);
+  float   abss  = App_Absf(s_speed_rpm);
+  float   abst  = App_Absf(s_target_rpm);
+  uint8_t over  = 0u;
+
+  /* --- 过速: 绝对上限, 或"实际远超目标"(正反馈失控的特征) --- */
+  if (abss > APP_OVERSPEED_RPM)
+  {
+    over = 1u;
+  }
+  else if ((abst >= APP_OVERSPEED_MIN_TARGET) &&
+           (abss > ((2.0f * abst) + APP_OVERSPEED_MARGIN)))
+  {
+    over = 1u;
+  }
+
+  if (over != 0u)
+  {
+    if (s_over_cnt < 0xFFFFu) { s_over_cnt++; }
+  }
+  else
+  {
+    s_over_cnt = 0u;
+  }
+
+  /* --- 反馈丢失 (只在有输出时判) --- */
+  if ((absd >= (0.9f * (float)MOTOR_PWM_MAX)) && (abss < APP_STALL_RPM))
+  {
+    if (s_stall_cnt < 0xFFFFu) { s_stall_cnt++; }
+  }
+  else
+  {
+    s_stall_cnt = 0u;
+  }
+
+  if (s_over_cnt >= APP_FAULT_TICKS)
+  {
+    App_LatchFault("FAULT OVERSPEED");
+  }
+  else if (s_stall_cnt >= APP_FAULT_TICKS)
+  {
+    App_LatchFault("FAULT NO FEEDBACK");
+  }
+  else
+  {
+    /* 正常 */
+  }
 }
 
 /* ============================ 命令处理 ============================ */
@@ -239,6 +350,7 @@ static void App_OnCommand(const char *cmd)
     if ((numeric != 0u) && (has_digit != 0u) && App_ParseFloat(cmd, &v))
     {
       s_target_rpm = App_Clampf(v, -APP_TARGET_LIMIT, APP_TARGET_LIMIT);
+      App_EnableDrive();                 /* 设定目标即视为要运行, 不必再发 START */
       App_SetMsg("TARGET SET");
       return;
     }
@@ -249,6 +361,7 @@ static void App_OnCommand(const char *cmd)
     if (App_ParseFloat(rest, &v))
     {
       s_target_rpm = App_Clampf(v, -APP_TARGET_LIMIT, APP_TARGET_LIMIT);
+      App_EnableDrive();
       App_SetMsg("TARGET SET");
     }
   }
@@ -305,6 +418,20 @@ static void App_OnCommand(const char *cmd)
       App_SetMsg("SAFE SET");
     }
   }
+  else if (App_MatchWord(cmd, "TEXT", &rest))
+  {
+    if (App_ParseFloat(rest, &v))
+    {
+      uint8_t on = (v != 0.0f) ? 1u : 0u;
+
+      /* 先强制打开再回显, 保证 TEXT 0 的确认信息也发得出去,
+         之后才真正应用新状态 (否则关闭后再也收不到回显) */
+      VOFA_SetTextReply(1u);
+      VOFA_SendLine(on != 0u ? "TEXT REPLY ON" : "TEXT REPLY OFF");
+      VOFA_SetTextReply(on);
+      App_SetMsg(on != 0u ? "TEXT ON" : "TEXT OFF");
+    }
+  }
   else if (App_MatchWord(cmd, "DUTY", &rest))
   {
     if (App_ParseFloat(rest, &v))
@@ -312,13 +439,13 @@ static void App_OnCommand(const char *cmd)
       v = App_Clampf(v, -(float)MOTOR_PWM_MAX, (float)MOTOR_PWM_MAX);
       s_open_duty   = (int16_t)v;
       s_closed_loop = 0u;
+      App_EnableDrive();              /* 开环测试也直接使能, 便于单独验证接线 */
       App_SetMsg("OPEN LOOP DUTY");
     }
   }
   else if (App_MatchWord(cmd, "START", &rest))
   {
-    s_enabled = 1u;
-    PID_Reset(&s_pid);
+    App_EnableDrive();
     App_SetMsg("START");
   }
   else if (App_MatchWord(cmd, "STOP", &rest))
@@ -327,12 +454,12 @@ static void App_OnCommand(const char *cmd)
     s_target_rpm  = 0.0f;
     s_open_duty   = 0;
     Motor_Stop();
-    PID_Reset(&s_pid);
+    App_ClearFault();
     App_SetMsg("STOP");
   }
   else if (App_MatchWord(cmd, "RESET", &rest))
   {
-    PID_Reset(&s_pid);
+    App_ClearFault();
     Encoder_Reset();
     App_SetMsg("PID RESET");
   }
@@ -386,6 +513,14 @@ static void App_ControlStep(void)
     }
   }
 
+  /* 保护锁定: 停机直到被 START / RESET / 新目标值 解除 */
+  if (s_fault != 0u)
+  {
+    Motor_Stop();
+    s_err = s_target_rpm - s_speed_rpm;
+    return;
+  }
+
   if (s_enabled == 0u)
   {
     Motor_Stop();
@@ -406,6 +541,8 @@ static void App_ControlStep(void)
     s_err = s_target_rpm - s_speed_rpm;
     Motor_SetDuty(s_open_duty);
   }
+
+  App_FaultCheck();
 }
 
 /* ============================ 上报 (主循环) ============================ */
@@ -476,7 +613,7 @@ static void App_DisplayTask(void)
 
   /* ---------- 状态 ---------- */
   OLED_DrawString(0u, 48u, s_closed_loop ? "CL" : "OP");
-  OLED_DrawString(18u, 48u, s_enabled ? "EN" : "--");
+  OLED_DrawString(18u, 48u, (s_fault != 0u) ? "FLT" : (s_enabled ? "EN" : "--"));
   OLED_DrawString(36u, 48u, (HAL_GetTick() - VOFA_GetLastRxTick()) < 2000u ? "LNK" : "   ");
   OLED_DrawString(60u, 48u, "RPM");
   (void)FMT_Int(b1, (int)sizeof(b1), Encoder_GetDelta());
@@ -549,12 +686,41 @@ void App_Init(void)
   /* 5. VOFA+ 串口 */
   VOFA_Init();
 
-  VOFA_SendLine("");
-  VOFA_SendLine("=== STM32F407 DC Motor Speed Control (PID) ===");
-  App_Help();
+  /* 文本回显在 JustFloat 模式下默认关闭 (二进制流里混 ASCII 会污染波形),
+     所以开机横幅只在 FireWater 模式或已打开回显时才真正发得出去。
+     想在这里看到帮助信息: 先在发送框发 TEXT 1。 */
+  if (VOFA_GetProtocol() != 0u)
+  {
+    VOFA_SendLine("=== JustFloat: set CHANNEL COUNT = 4 in VOFA+ ===");
+    VOFA_SendLine("send TEXT 1 to unmute text replies, HELP for commands");
+  }
+  else
+  {
+    VOFA_SendLine("");
+    VOFA_SendLine("=== STM32F407 DC Motor Speed Control (PID) ===");
+    App_Help();
+  }
+
+  /* 6. 上电默认目标与使能
+     APP_AUTO_START = 1 时上电即按 APP_DEFAULT_TARGET_RPM 运行,
+     这样第一次上电就能直接看到电机转、VOFA+ 出曲线。
+     编码器极性接反/没接 会分别触发过速保护与反馈丢失保护。 */
+  s_target_rpm  = APP_DEFAULT_TARGET_RPM;
+  s_open_duty   = 0;
+  s_closed_loop = 1u;
+  s_fault       = 0u;
+  s_over_cnt    = 0u;
+  s_stall_cnt   = 0u;
+  s_enabled     = 0u;
+
+#if (APP_AUTO_START != 0u)
+  s_enabled = 1u;
+  App_SetMsg("AUTO RUN");
+#else
+  App_SetMsg("READY");
+#endif
 
   s_ms = 0u;
-  App_SetMsg("READY");
 }
 
 void App_Tick(void)
