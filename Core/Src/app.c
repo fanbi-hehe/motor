@@ -21,7 +21,7 @@
 static PID_t  s_pid;
 
 static volatile float   s_target_rpm    = 0.0f;   /* 目标转速 (RPM) */
-static volatile uint8_t s_enab led       = 0u;     /* 闭环/开环总使能 */
+static volatile uint8_t s_enabled       = 0u;     /* 闭环/开环总使能 */
 static volatile uint8_t s_closed_loop   = 1u;     /* 1 = 闭环, 0 = 开环 */
 static volatile int16_t s_open_duty     = 0;      /* 开环占空比 */
 static volatile uint32_t s_safe_ms      = 0u;     /* 通信超时保护 (0 = 关闭) */
