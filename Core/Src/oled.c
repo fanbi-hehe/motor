@@ -1,385 +1,240 @@
 /**
-  ******************************************************************************
-  * @file    oled.c
-  * @brief   0.98 寸 I2C OLED 显示驱动 (SSD1306 / SSD1315 兼容)
-  ******************************************************************************
-  */
-
+ * oled.c —— 0.98 寸 I2C OLED 驱动 (128x64, SSD1306 / SH1106 通用)
+ * ------------------------------------------------------------------
+ * 用"页寻址"直接往屏幕 RAM 里写:
+ *   - 屏幕分成 8 页, 每页 8 个像素高、128 列宽
+ *   - 每个字符 6 列 x 8 行, 一页正好放一行字
+ *   - 每次把一行(21 个字 = 126 列)拼成 126 字节发出去
+ *
+ * 这样做不需要显存, 也不需要整屏刷新, 单次 I2C 只占几毫秒。
+ */
 #include "oled.h"
-#include "oled_font.h"
-#include "fmt.h"
-#include "main.h"
 #include "i2c.h"
 #include <string.h>
 
-/* ============================ 内部常量 ============================ */
+/* 7 位地址左移 1 位。大部分模块是 0x3C, 少数是 0x3D */
+#define OLED_ADDR_7BIT   0x3C
+#define OLED_ADDR_ALT    0x3D
 
-#define OLED_CMD_PREFIX   0x00u    /* 控制字节: 后续为命令 */
-#define OLED_DAT_PREFIX   0x40u    /* 控制字节: 后续为数据 */
+#define FONT_W           6      /* 每个字符 6 列 */
+#define COLS             21     /* 128 / 6 = 21 个字符 */
 
-#define OLED_I2C_TIMEOUT  100u     /* ms */
+static uint8_t s_addr8 = (OLED_ADDR_7BIT << 1);   /* 实际用的 8 位地址 */
 
-#define OLED_MAX_FAILS    3u       /* 连续失败多少次后复位 I2C */
+/* ---------------------------------------------------------------- */
+/* 6x8 ASCII 字库: 字符 32(' ') ~ 126('~'), 每个 6 字节                */
+/* 每个字节是一列, bit0 在上面, bit7 在下面                          */
+/* ---------------------------------------------------------------- */
+static const uint8_t font6x8[95][FONT_W] = {
+  {0x00,0x00,0x00,0x00,0x00,0x00}, /* ' ' */
+  {0x00,0x00,0x5F,0x00,0x00,0x00}, /* '!' */
+  {0x00,0x07,0x00,0x07,0x00,0x00}, /* '"' */
+  {0x14,0x7F,0x14,0x7F,0x14,0x00}, /* '#' */
+  {0x24,0x2A,0x7F,0x2A,0x12,0x00}, /* '$' */
+  {0x23,0x13,0x08,0x64,0x62,0x00}, /* '%' */
+  {0x36,0x49,0x55,0x22,0x50,0x00}, /* '&' */
+  {0x00,0x05,0x03,0x00,0x00,0x00}, /* ''' */
+  {0x00,0x1C,0x22,0x41,0x00,0x00}, /* '(' */
+  {0x00,0x41,0x22,0x1C,0x00,0x00}, /* ')' */
+  {0x08,0x2A,0x1C,0x2A,0x08,0x00}, /* '*' */
+  {0x08,0x08,0x3E,0x08,0x08,0x00}, /* '+' */
+  {0x00,0x50,0x30,0x00,0x00,0x00}, /* ',' */
+  {0x08,0x08,0x08,0x08,0x08,0x00}, /* '-' */
+  {0x00,0x60,0x60,0x00,0x00,0x00}, /* '.' */
+  {0x20,0x10,0x08,0x04,0x02,0x00}, /* '/' */
+  {0x3E,0x51,0x49,0x45,0x3E,0x00}, /* '0' */
+  {0x00,0x42,0x7F,0x40,0x00,0x00}, /* '1' */
+  {0x42,0x61,0x51,0x49,0x46,0x00}, /* '2' */
+  {0x21,0x41,0x45,0x4B,0x31,0x00}, /* '3' */
+  {0x18,0x14,0x12,0x7F,0x10,0x00}, /* '4' */
+  {0x27,0x45,0x45,0x45,0x39,0x00}, /* '5' */
+  {0x3C,0x4A,0x49,0x49,0x30,0x00}, /* '6' */
+  {0x01,0x71,0x09,0x05,0x03,0x00}, /* '7' */
+  {0x36,0x49,0x49,0x49,0x36,0x00}, /* '8' */
+  {0x06,0x49,0x49,0x29,0x1E,0x00}, /* '9' */
+  {0x00,0x36,0x36,0x00,0x00,0x00}, /* ':' */
+  {0x00,0x56,0x36,0x00,0x00,0x00}, /* ';' */
+  {0x00,0x08,0x14,0x22,0x41,0x00}, /* '<' */
+  {0x14,0x14,0x14,0x14,0x14,0x00}, /* '=' */
+  {0x41,0x22,0x14,0x08,0x00,0x00}, /* '>' */
+  {0x02,0x01,0x51,0x09,0x06,0x00}, /* '?' */
+  {0x32,0x49,0x79,0x41,0x3E,0x00}, /* '@' */
+  {0x7E,0x11,0x11,0x11,0x7E,0x00}, /* 'A' */
+  {0x7F,0x49,0x49,0x49,0x36,0x00}, /* 'B' */
+  {0x3E,0x41,0x41,0x41,0x22,0x00}, /* 'C' */
+  {0x7F,0x41,0x41,0x22,0x1C,0x00}, /* 'D' */
+  {0x7F,0x49,0x49,0x49,0x41,0x00}, /* 'E' */
+  {0x7F,0x09,0x09,0x01,0x01,0x00}, /* 'F' */
+  {0x3E,0x41,0x41,0x51,0x32,0x00}, /* 'G' */
+  {0x7F,0x08,0x08,0x08,0x7F,0x00}, /* 'H' */
+  {0x00,0x41,0x7F,0x41,0x00,0x00}, /* 'I' */
+  {0x20,0x40,0x41,0x3F,0x01,0x00}, /* 'J' */
+  {0x7F,0x08,0x14,0x22,0x41,0x00}, /* 'K' */
+  {0x7F,0x40,0x40,0x40,0x40,0x00}, /* 'L' */
+  {0x7F,0x02,0x04,0x02,0x7F,0x00}, /* 'M' */
+  {0x7F,0x04,0x08,0x10,0x7F,0x00}, /* 'N' */
+  {0x3E,0x41,0x41,0x41,0x3E,0x00}, /* 'O' */
+  {0x7F,0x09,0x09,0x09,0x06,0x00}, /* 'P' */
+  {0x3E,0x41,0x51,0x21,0x5E,0x00}, /* 'Q' */
+  {0x7F,0x09,0x19,0x29,0x46,0x00}, /* 'R' */
+  {0x46,0x49,0x49,0x49,0x31,0x00}, /* 'S' */
+  {0x01,0x01,0x7F,0x01,0x01,0x00}, /* 'T' */
+  {0x3F,0x40,0x40,0x40,0x3F,0x00}, /* 'U' */
+  {0x1F,0x20,0x40,0x20,0x1F,0x00}, /* 'V' */
+  {0x7F,0x20,0x18,0x20,0x7F,0x00}, /* 'W' */
+  {0x63,0x14,0x08,0x14,0x63,0x00}, /* 'X' */
+  {0x03,0x04,0x78,0x04,0x03,0x00}, /* 'Y' */
+  {0x61,0x51,0x49,0x45,0x43,0x00}, /* 'Z' */
+  {0x00,0x00,0x7F,0x41,0x41,0x00}, /* '[' */
+  {0x02,0x04,0x08,0x10,0x20,0x00}, /* '\' */
+  {0x41,0x41,0x7F,0x00,0x00,0x00}, /* ']' */
+  {0x04,0x02,0x01,0x02,0x04,0x00}, /* '^' */
+  {0x40,0x40,0x40,0x40,0x40,0x00}, /* '_' */
+  {0x01,0x02,0x04,0x00,0x00,0x00}, /* '`' */
+  {0x20,0x54,0x54,0x54,0x78,0x00}, /* 'a' */
+  {0x7F,0x48,0x44,0x44,0x38,0x00}, /* 'b' */
+  {0x38,0x44,0x44,0x44,0x20,0x00}, /* 'c' */
+  {0x38,0x44,0x44,0x48,0x7F,0x00}, /* 'd' */
+  {0x38,0x54,0x54,0x54,0x18,0x00}, /* 'e' */
+  {0x08,0x7E,0x09,0x01,0x02,0x00}, /* 'f' */
+  {0x08,0x14,0x54,0x54,0x3C,0x00}, /* 'g' */
+  {0x7F,0x08,0x04,0x04,0x78,0x00}, /* 'h' */
+  {0x00,0x44,0x7D,0x40,0x00,0x00}, /* 'i' */
+  {0x20,0x40,0x44,0x3D,0x00,0x00}, /* 'j' */
+  {0x00,0x7F,0x10,0x28,0x44,0x00}, /* 'k' */
+  {0x00,0x41,0x7F,0x40,0x00,0x00}, /* 'l' */
+  {0x7C,0x04,0x18,0x04,0x78,0x00}, /* 'm' */
+  {0x7C,0x08,0x04,0x04,0x78,0x00}, /* 'n' */
+  {0x38,0x44,0x44,0x44,0x38,0x00}, /* 'o' */
+  {0x7C,0x14,0x14,0x14,0x08,0x00}, /* 'p' */
+  {0x08,0x14,0x14,0x18,0x7C,0x00}, /* 'q' */
+  {0x7C,0x08,0x04,0x04,0x08,0x00}, /* 'r' */
+  {0x48,0x54,0x54,0x54,0x20,0x00}, /* 's' */
+  {0x04,0x3F,0x44,0x40,0x20,0x00}, /* 't' */
+  {0x3C,0x40,0x40,0x20,0x7C,0x00}, /* 'u' */
+  {0x1C,0x20,0x40,0x20,0x1C,0x00}, /* 'v' */
+  {0x3C,0x40,0x30,0x40,0x3C,0x00}, /* 'w' */
+  {0x44,0x28,0x10,0x28,0x44,0x00}, /* 'x' */
+  {0x0C,0x50,0x50,0x50,0x3C,0x00}, /* 'y' */
+  {0x44,0x64,0x54,0x4C,0x44,0x00}, /* 'z' */
+  {0x00,0x08,0x36,0x41,0x00,0x00}, /* '{' */
+  {0x00,0x00,0x7F,0x00,0x00,0x00}, /* '|' */
+  {0x00,0x41,0x36,0x08,0x00,0x00}, /* '}' */
+  {0x10,0x08,0x08,0x10,0x08,0x00}, /* '~' */
+};
 
-/* ============================ 内部状态 ============================ */
+/* ---------------------------------------------------------------- */
+/* 底层: 发命令 / 发数据                                             */
+/* ---------------------------------------------------------------- */
 
-static uint8_t  s_fb[OLED_PAGES][OLED_WIDTH];
-static uint8_t  s_dirty[OLED_PAGES];
-static uint8_t  s_present = 0u;
-static uint16_t s_addr    = (uint16_t)(OLED_I2C_ADDR_PRIMARY << 1);
-
-/* I2C 发送缓冲: 1 字节控制字 + 一页数据 (放在静态区, 避免占用栈) */
-static uint8_t  s_i2cbuf[1u + OLED_WIDTH];
-
-/* ============================ 底层 I2C ============================ */
-
-static HAL_StatusTypeDef _i2c_write(uint8_t prefix, const uint8_t *data, uint16_t len)
+/* 发 1 个命令字节 (控制字节 0x00 表示"后面是命令") */
+static void OLED_Cmd(uint8_t cmd)
 {
-  static uint8_t s_fail = 0u;
-  HAL_StatusTypeDef st;
-
-  if ((data == 0) || (len > OLED_WIDTH))
-  {
-    return HAL_ERROR;
-  }
-
-  s_i2cbuf[0] = prefix;
-  if (len > 0u)
-  {
-    memcpy(&s_i2cbuf[1], data, len);
-  }
-
-  st = HAL_I2C_Master_Transmit(&hi2c1, s_addr, s_i2cbuf, (uint16_t)(len + 1u),
-                               OLED_I2C_TIMEOUT);
-  if (st != HAL_OK)
-  {
-    s_fail++;
-    if (s_fail >= OLED_MAX_FAILS)
-    {
-      /* 连续失败: 复位 I2C 外设, 处理总线被拉死的情况 */
-      s_fail = 0u;
-      (void)HAL_I2C_DeInit(&hi2c1);
-      MX_I2C1_Init();
-    }
-  }
-  else
-  {
-    s_fail = 0u;
-  }
-  return st;
+  uint8_t buf[2];
+  buf[0] = 0x00;
+  buf[1] = cmd;
+  HAL_I2C_Master_Transmit(&hi2c1, s_addr8, buf, 2, 100);
 }
 
-static HAL_StatusTypeDef _write_cmd(uint8_t cmd)
+/* 指定"从第几页的第 0 列开始写" */
+static void OLED_SetPos(uint8_t page)
 {
-  uint8_t tmp = cmd;
-  return _i2c_write(OLED_CMD_PREFIX, &tmp, 1u);
+  OLED_Cmd((uint8_t)(0xB0 | (page & 0x07)));   /* 页地址 */
+  OLED_Cmd(0x00);                              /* 列地址低 4 位 */
+  OLED_Cmd(0x10);                              /* 列地址高 4 位 */
 }
 
-static HAL_StatusTypeDef _write_cmd2(uint8_t cmd, uint8_t arg)
+/* ---------------------------------------------------------------- */
+/* 对外接口                                                          */
+/* ---------------------------------------------------------------- */
+
+void OLED_Init(void)
 {
-  uint8_t tmp[2];
-  tmp[0] = cmd;
-  tmp[1] = arg;
-  return _i2c_write(OLED_CMD_PREFIX, tmp, 2u);
-}
-
-/* ============================ 初始化 ============================ */
-
-#if (OLED_CTRL_SH1106 != 0)
-/* SH1106: 不支持 0x20/0x21/0x22 寻址命令, 用页 + 列地址设置 */
-static void _set_page_window(uint8_t page)
-{
-  _write_cmd((uint8_t)(0xB0u | page));
-  _write_cmd(0x00);                 /* 低列地址 (含 SH1106 的 2 列偏移) */
-  _write_cmd(0x10);                 /* 高列地址 */
-}
-#else
-/* SSD1306: 水平寻址, 限定为当前页 (col 0..127, page = page) */
-static void _set_page_window(uint8_t page)
-{
-  (void)_write_cmd2(0x21, 0x00);    /* 列起始 */
-  (void)_write_cmd(0x7Fu);          /* 列结束 = 127 */
-  (void)_write_cmd2(0x22, page);    /* 页起始 */
-  (void)_write_cmd(page);           /* 页结束 */
-}
-#endif
-
-#define OLED_START_LINE  0x40u
-
-static void _init_sequence(void)
-{
-  (void)_write_cmd(0xAEu);                      /* 关显示 */
-
-  (void)_write_cmd2(0xD5u, 0x80u);              /* 时钟分频 */
-  (void)_write_cmd2(0xA8u, (uint8_t)(OLED_HEIGHT - 1u)); /* 复用率 */
-  (void)_write_cmd2(0xD3u, 0x00u);              /* 显示偏移 */
-  (void)_write_cmd(OLED_START_LINE);            /* 起始行 */
-
-  (void)_write_cmd2(0x8Du, 0x14u);              /* 电荷泵开 */
-
-#if (OLED_CTRL_SH1106 == 0)
-  (void)_write_cmd2(0x20u, 0x00u);              /* 水平寻址模式 */
-#endif
-
-  (void)_write_cmd(0xA1u);                      /* 段重映射 (左右镜像) */
-  (void)_write_cmd(0xC8u);                      /* COM 扫描方向 (上下镜像) */
-
-  if (OLED_HEIGHT == 32u)
-  {
-    (void)_write_cmd2(0xDAu, 0x02u);            /* COM 引脚配置: 32 行 */
-    (void)_write_cmd2(0x81u, 0x8Fu);            /* 对比度 */
-  }
-  else
-  {
-    (void)_write_cmd2(0xDAu, 0x12u);            /* COM 引脚配置: 64 行 */
-    (void)_write_cmd2(0x81u, 0xCFu);            /* 对比度 */
-  }
-
-  (void)_write_cmd2(0xD9u, 0xF1u);              /* 预充电周期 */
-  (void)_write_cmd2(0xDBu, 0x40u);              /* VCOMH 反选电平 */
-
-  (void)_write_cmd(0xA4u);                      /* 显示跟随 RAM */
-  (void)_write_cmd(0xA6u);                      /* 正常显示 (非反色) */
-  (void)_write_cmd(0x2Eu);                      /* 关闭滚动 */
-}
-
-static uint8_t _probe(uint16_t addr7)
-{
-  s_addr = (uint16_t)(addr7 << 1);
-  return (HAL_I2C_IsDeviceReady(&hi2c1, s_addr, 2u, 50u) == HAL_OK) ? 1u : 0u;
-}
-
-uint8_t OLED_Init(void)
-{
-  uint8_t found;
-
-  s_present = 0u;
-
-  found = _probe(OLED_I2C_ADDR_PRIMARY);
-  if (found == 0u)
-  {
-    found = _probe(OLED_I2C_ADDR_ALT);
-  }
-  if (found == 0u)
-  {
-    s_addr = (uint16_t)(OLED_I2C_ADDR_PRIMARY << 1);
-    return 0u;                    /* 未接屏幕: 不影响电机控制 */
-  }
-
-  _init_sequence();
-
-  memset(s_fb, 0x00, sizeof(s_fb));
-  memset(s_dirty, 0x01, sizeof(s_dirty));
-
-  s_present = 1u;
-  OLED_Refresh();                 /* 推一帧全黑 */
-  (void)_write_cmd(0xAFu);        /* 开显示 */
-
-  return 1u;
-}
-
-uint8_t OLED_IsPresent(void)
-{
-  return s_present;
-}
-
-void OLED_DisplayOn(uint8_t on)
-{
-  (void)_write_cmd((on != 0u) ? 0xAFu : 0xAEu);
-}
-
-/* ============================ 显存刷新 ============================ */
-
-void OLED_Clear(void)
-{
-  memset(s_fb, 0x00, sizeof(s_fb));
-  memset(s_dirty, 0x01, sizeof(s_dirty));
-}
-
-void OLED_ClearLine(uint8_t page)
-{
-  if (page >= OLED_PAGES)
-  {
-    return;
-  }
-  memset(s_fb[page], 0x00, OLED_WIDTH);
-  s_dirty[page] = 1u;
-}
-
-void OLED_RefreshAll(void)
-{
-  memset(s_dirty, 0x01, sizeof(s_dirty));
-  OLED_Refresh();
-}
-
-void OLED_Refresh(void)
-{
+  /* 初始化命令表 (SSD1306 和 SH1106 都认这套) */
+  static const uint8_t init_cmd[] = {
+    0xAE,              /* 关显示 */
+    0xD5, 0x80,        /* 时钟分频 */
+    0xA8, 0x3F,        /* 复用率 = 64 行 */
+    0xD3, 0x00,        /* 显示偏移 0 */
+    0x40,              /* 起始行 0 */
+    0x8D, 0x14,        /* 开电荷泵 (OLED 必须) */
+    0xA1,              /* 左右不镜像 */
+    0xC8,              /* 上下不镜像 */
+    0xDA, 0x12,        /* COM 引脚配置 */
+    0x81, 0xCF,        /* 对比度 */
+    0xD9, 0xF1,        /* 预充电周期 */
+    0xDB, 0x40,        /* VCOMH */
+    0xA4,              /* 显示跟随 RAM */
+    0xA6,              /* 正常显示(不反色) */
+    0xAF,              /* 开显示 */
+  };
+  uint8_t buf[1 + 128];
   uint8_t page;
 
-  if (s_present == 0u)
+  /* 找屏幕: 先试 0x3C, 不响应再试 0x3D */
+  if (HAL_I2C_IsDeviceReady(&hi2c1, (OLED_ADDR_7BIT << 1), 2, 50) == HAL_OK)
   {
-    return;
+    s_addr8 = (OLED_ADDR_7BIT << 1);
   }
-
-  for (page = 0u; page < OLED_PAGES; page++)
+  else if (HAL_I2C_IsDeviceReady(&hi2c1, (OLED_ADDR_ALT << 1), 2, 50) == HAL_OK)
   {
-    if (s_dirty[page] == 0u)
-    {
-      continue;
-    }
-
-    _set_page_window(page);
-    if (_i2c_write(OLED_DAT_PREFIX, s_fb[page], OLED_WIDTH) == HAL_OK)
-    {
-      s_dirty[page] = 0u;
-    }
-    else
-    {
-      break;                      /* I2C 异常: 保留脏标记, 下次重试 */
-    }
-  }
-}
-
-/* ============================ 绘制 ============================ */
-
-void OLED_DrawPixel(uint8_t x, uint8_t y, uint8_t on)
-{
-  uint8_t page;
-  uint8_t mask;
-
-  if ((x >= OLED_WIDTH) || (y >= OLED_HEIGHT))
-  {
-    return;
-  }
-
-  page = (uint8_t)(y >> 3);
-  mask = (uint8_t)(1u << (y & 7u));
-
-  if (on != 0u)
-  {
-    s_fb[page][x] |= mask;
+    s_addr8 = (OLED_ADDR_ALT << 1);
   }
   else
   {
-    s_fb[page][x] &= (uint8_t)~mask;
-  }
-  s_dirty[page] = 1u;
-}
-
-static void _draw_char(uint8_t x, uint8_t y, char c, uint8_t scale)
-{
-  const uint8_t *glyph;
-  uint8_t col;
-  uint8_t row;
-  uint8_t sx;
-  uint8_t sy;
-
-  if ((c < (char)OLED_FONT_FIRST_CHAR) || (c > (char)OLED_FONT_LAST_CHAR))
-  {
-    c = ' ';
+    return;                        /* 没接屏幕就直接不显示, 不影响电机 */
   }
 
-  if (scale == 0u)
-  {
-    scale = 1u;
-  }
+  /* 一次性把初始化命令发完: buf[0]=0x00 表示后面全是命令 */
+  buf[0] = 0x00;
+  memcpy(&buf[1], init_cmd, sizeof(init_cmd));
+  HAL_I2C_Master_Transmit(&hi2c1, s_addr8, buf,
+                          (uint16_t)(1u + sizeof(init_cmd)), 100);
 
-  glyph = s_oled_font6x8[(uint8_t)c - OLED_FONT_FIRST_CHAR];
-
-  for (col = 0u; col < OLED_FONT_WIDTH; col++)
+  /* 清屏: 8 页全部写 0 */
+  memset(&buf[1], 0x00, 128);
+  buf[0] = 0x40;                   /* 0x40 = 后面是数据 */
+  for (page = 0; page < 8; page++)
   {
-    uint8_t bits = glyph[col];
-    for (row = 0u; row < OLED_FONT_HEIGHT; row++)
-    {
-      if ((bits & (uint8_t)(1u << row)) == 0u)
-      {
-        continue;
-      }
-      for (sy = 0u; sy < scale; sy++)
-      {
-        for (sx = 0u; sx < scale; sx++)
-        {
-          OLED_DrawPixel((uint8_t)(x + (col * scale) + sx),
-                         (uint8_t)(y + (row * scale) + sy), 1u);
-        }
-      }
-    }
+    OLED_SetPos(page);
+    HAL_I2C_Master_Transmit(&hi2c1, s_addr8, buf, 129, 100);
   }
 }
 
-uint8_t OLED_DrawStringScaled(uint8_t x, uint8_t y, const char *str, uint8_t scale)
+void OLED_ShowLine(uint8_t line, const char *text)
 {
-  uint8_t cx = x;
-
-  if (str == 0)
-  {
-    return x;
-  }
-  if (scale == 0u)
-  {
-    scale = 1u;
-  }
-
-  while (*str != '\0')
-  {
-    if (cx >= OLED_WIDTH)
-    {
-      break;
-    }
-    _draw_char(cx, y, *str, scale);
-    cx = (uint8_t)(cx + (OLED_FONT_WIDTH * scale));
-    str++;
-  }
-  return cx;
-}
-
-uint8_t OLED_DrawString(uint8_t x, uint8_t y, const char *str)
-{
-  return OLED_DrawStringScaled(x, y, str, 1u);
-}
-
-void OLED_DrawStringScaledPad(uint8_t x, uint8_t y, const char *str,
-                              uint8_t scale, uint8_t chars)
-{
+  uint8_t buf[1 + COLS * FONT_W];   /* 1 个控制字节 + 126 个点阵字节 */
   uint8_t i;
-  uint8_t adv;
-  uint8_t cx = x;
+  uint8_t ended = 0;
 
-  if (scale == 0u)
+  if (line > 7)
   {
-    scale = 1u;
+    return;
   }
-  adv = (uint8_t)(OLED_FONT_WIDTH * scale);
 
-  /* 先擦除整段区域, 保证不会留下上一次更长的字符串残影 */
-  for (i = 0u; i < chars; i++)
+  buf[0] = 0x40;                    /* 后面是显示数据 */
+
+  /* 把字符串拆成点阵, 不足 21 字补空格(顺便擦掉上一次的残留) */
+  for (i = 0; i < COLS; i++)
   {
-    if (cx >= OLED_WIDTH)
+    uint8_t c = ' ';
+
+    if (ended == 0u)
     {
-      break;
+      c = (uint8_t)text[i];
+      if (c == '\0')
+      {
+        ended = 1u;                 /* 遇到结束符之后一律补空格 */
+        c = ' ';
+      }
     }
-    _draw_char(cx, y, ' ', scale);
-    cx = (uint8_t)(cx + adv);
+    if ((c < 32u) || (c > 126u))
+    {
+      c = ' ';
+    }
+    memcpy(&buf[1 + i * FONT_W], font6x8[c - 32], FONT_W);
   }
 
-  (void)OLED_DrawStringScaled(x, y, str, scale);
-}
-
-void OLED_DrawStringPad(uint8_t x, uint8_t y, const char *str, uint8_t chars)
-{
-  OLED_DrawStringScaledPad(x, y, str, 1u, chars);
-}
-
-uint8_t OLED_DrawInt(uint8_t x, uint8_t y, int32_t v)
-{
-  char buf[12];
-  (void)FMT_Int(buf, (int)sizeof(buf), v);
-  return OLED_DrawString(x, y, buf);
-}
-
-uint8_t OLED_DrawFloat(uint8_t x, uint8_t y, float v, uint8_t decimals)
-{
-  char buf[16];
-  (void)FMT_Float(buf, (int)sizeof(buf), v, decimals);
-  return OLED_DrawString(x, y, buf);
+  OLED_SetPos(line);
+  HAL_I2C_Master_Transmit(&hi2c1, s_addr8, buf, (uint16_t)sizeof(buf), 100);
 }

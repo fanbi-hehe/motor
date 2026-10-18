@@ -45,13 +45,11 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
-    Core/Src/app.c
-    Core/Src/pid.c
-    Core/Src/encoder.c
     Core/Src/motor.c
-    Core/Src/vofa.c
+    Core/Src/encoder.c
+    Core/Src/pid.c
+    Core/Src/comm.c
     Core/Src/oled.c
-    Core/Src/fmt.c
 )
 
 # Add include paths
@@ -59,6 +57,10 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
     Core/Inc
 )
+
+# 让 snprintf 支持 %f (OLED 上显示 PID 参数要用)。
+# newlib-nano 默认不带浮点格式化, 加上这一行才会链进来, 大约多占 8KB Flash。
+target_link_options(${CMAKE_PROJECT_NAME} PRIVATE -u _printf_float)
 
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE

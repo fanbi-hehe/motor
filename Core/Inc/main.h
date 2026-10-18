@@ -53,7 +53,7 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
-
+void Control_Tick(void);          /* SysTick 里每 10ms 调一次, 跑速度环 */
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/

@@ -23,8 +23,6 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "usart.h"
-#include "vofa.h"
-#include "app.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -190,8 +188,7 @@ void SysTick_Handler(void)
   /* USER CODE END SysTick_IRQn 0 */
   HAL_IncTick();
   /* USER CODE BEGIN SysTick_IRQn 1 */
-  /* 10 ms 速度环 / 20 ms 上报标志 / 100 ms 显示标志 */
-  App_Tick();
+  Control_Tick();      /* 数到 10ms 就跑一次速度环, 保证采样周期准确 */
   /* USER CODE END SysTick_IRQn 1 */
 }
 
@@ -205,16 +202,14 @@ void SysTick_Handler(void)
 /* USER CODE BEGIN 1 */
 
 /**
-  * @brief  USART1 中断: 交给 VOFA 驱动处理收发
+  * @brief  USART1 中断: 收串口命令
   *
-  *  收发都不走 HAL 的状态机, 直接操作寄存器:
-  *   - RXNE -> 收字节进环形缓冲, 同时清 ORE/NE/FE/PE
-  *   - TXE  -> 从发送环形缓冲取字节写 DR, 发完自动关 TXE 中断
-  *  这样底层就没有阻塞式发送, 数据帧的节奏不会被 I2C 刷屏打断。
+  *  HAL_UART_Receive_IT() 收满 1 个字节就会调用一次
+  *  HAL_UART_RxCpltCallback() (在 main.c 里), 那边负责拼成一条命令。
   */
 void USART1_IRQHandler(void)
 {
-  VOFA_IrqHandler();
+  HAL_UART_IRQHandler(&huart1);
 }
 
 /* USER CODE END 1 */
